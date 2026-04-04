@@ -250,45 +250,54 @@ class TestJobCleanup:
         assert "finished_at" not in app_module.jobs[job_id]
         del app_module.jobs[job_id]
 
-    def test_expired_job_cleaned_up(self, tmp_path):
+    def test_expired_job_cleaned_up(self):
         """TTL経過済みのdoneジョブはクリーンアップされる"""
         job_id = "ttl-expired"
         job_dir = app_module.WORK_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "short_01.mp4").write_bytes(b"\x00")
 
-        app_module.jobs[job_id] = {
-            "status": "done", "progress": 100, "logs": [], "results": [],
-            "finished_at": time.time() - app_module.JOB_TTL_SECONDS - 1,  # TTL超過
-        }
+        app_module._create_job(job_id)
+        expired_at = time.time() - app_module.JOB_TTL_SECONDS - 1
+        with app_module._db_lock, app_module._get_conn() as conn:
+            conn.execute("UPDATE jobs SET status='done', finished_at=? WHERE job_id=?",
+                         (expired_at, job_id))
 
         # クリーンアップロジックを直接実行
         now = time.time()
-        for jid, job in list(app_module.jobs.items()):
-            if job.get("status") in ("done", "error"):
-                if now - job.get("finished_at", now) >= app_module.JOB_TTL_SECONDS:
-                    import shutil
-                    shutil.rmtree(app_module.WORK_DIR / jid, ignore_errors=True)
-                    app_module.jobs.pop(jid, None)
+        with app_module._db_lock, app_module._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if now - row["finished_at"] >= app_module.JOB_TTL_SECONDS:
+                shutil.rmtree(app_module.WORK_DIR / row["job_id"], ignore_errors=True)
+                with app_module._db_lock, app_module._get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
 
-        assert job_id not in app_module.jobs
+        assert app_module._get_job(job_id) is None
         assert not (app_module.WORK_DIR / job_id).exists()
 
     def test_fresh_job_not_cleaned_up(self):
         """TTL未経過のdoneジョブは削除されない"""
         job_id = "ttl-fresh"
-        app_module.jobs[job_id] = {
-            "status": "done", "progress": 100, "logs": [], "results": [],
-            "finished_at": time.time() - 10,  # 10秒前（TTL未達）
-        }
-        now = time.time()
-        for jid, job in list(app_module.jobs.items()):
-            if job.get("status") in ("done", "error"):
-                if now - job.get("finished_at", now) >= app_module.JOB_TTL_SECONDS:
-                    app_module.jobs.pop(jid, None)
+        app_module._create_job(job_id)
+        fresh_at = time.time() - 10  # 10秒前（TTL未達）
+        with app_module._db_lock, app_module._get_conn() as conn:
+            conn.execute("UPDATE jobs SET status='done', finished_at=? WHERE job_id=?",
+                         (fresh_at, job_id))
 
-        assert job_id in app_module.jobs
-        del app_module.jobs[job_id]
+        now = time.time()
+        with app_module._db_lock, app_module._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if row["job_id"] == job_id and now - row["finished_at"] >= app_module.JOB_TTL_SECONDS:
+                with app_module._db_lock, app_module._get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
+
+        assert app_module._get_job(job_id) is not None
 
 
 # ── S4: Basic認証 ────────────────────────────────────────────
