@@ -53,18 +53,82 @@ def find_font():
         if line.strip() and os.path.exists(line.strip()): return line.strip()
     return None
 
-# ── ジョブ状態管理 ───────────────────────────────────────────
-jobs: dict[str, dict] = {}
+# ── S4: Basic認証 ────────────────────────────────────────────
+_security = HTTPBasic()
+
+def require_auth(credentials: HTTPBasicCredentials = Security(_security)):
+    if not APP_USERNAME or not APP_PASSWORD:
+        raise HTTPException(status_code=500, detail="APP_USERNAME / APP_PASSWORD が未設定です")
+    ok = (secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode()) and
+          secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode()))
+    if not ok:
+        raise HTTPException(status_code=401, detail="認証失敗",
+                            headers={"WWW-Authenticate": "Basic"})
+
+# ── B1: SQLiteジョブ管理 ─────────────────────────────────────
+_db_lock = threading.Lock()
+
+def _get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db():
+    with _db_lock, _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id      TEXT PRIMARY KEY,
+                status      TEXT    DEFAULT 'running',
+                progress    INTEGER DEFAULT 0,
+                logs        TEXT    DEFAULT '[]',
+                results     TEXT    DEFAULT '[]',
+                error       TEXT,
+                finished_at REAL
+            )
+        """)
+
+def _create_job(job_id: str):
+    with _db_lock, _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (job_id, status, progress, logs, results) VALUES (?,?,?,?,?)",
+            (job_id, "running", 0, "[]", "[]")
+        )
+
+def _get_job(job_id: str) -> dict | None:
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["logs"]    = json.loads(d["logs"]    or "[]")
+    d["results"] = json.loads(d["results"] or "[]")
+    return d
 
 def log(job_id: str, msg: str):
-    jobs[job_id]["logs"].append(msg)
     print(f"[{job_id[:6]}] {msg}")
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute("SELECT logs FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row:
+            logs = json.loads(row["logs"] or "[]")
+            logs.append(msg)
+            conn.execute("UPDATE jobs SET logs=? WHERE job_id=?", (json.dumps(logs, ensure_ascii=False), job_id))
 
 def set_progress(job_id: str, pct: int, status: str = "running"):
-    jobs[job_id]["progress"] = pct
-    jobs[job_id]["status"]   = status
-    if status in ("done", "error"):
-        jobs[job_id]["finished_at"] = time.time()
+    finished_at = time.time() if status in ("done", "error") else None
+    with _db_lock, _get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET progress=?, status=?, finished_at=COALESCE(?,finished_at) WHERE job_id=?",
+            (pct, status, finished_at, job_id)
+        )
+
+def _set_results(job_id: str, results: list):
+    with _db_lock, _get_conn() as conn:
+        conn.execute("UPDATE jobs SET results=? WHERE job_id=?",
+                     (json.dumps(results, ensure_ascii=False), job_id))
+
+def _set_error(job_id: str, error: str):
+    with _db_lock, _get_conn() as conn:
+        conn.execute("UPDATE jobs SET error=? WHERE job_id=?", (error, job_id))
 
 # ── メイン処理（バックグラウンド） ──────────────────────────
 def run_job(job_id: str, youtube_url: str, thumb_path: str,
