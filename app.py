@@ -5,9 +5,9 @@
 ブラウザ: http://localhost:8000
 """
 
-import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading
+import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading, time
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -15,6 +15,17 @@ import uvicorn
 # ── 設定 ────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WORK_DIR   = Path("./web_output")
+
+# アップロード検証
+ALLOWED_THUMB_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
+ALLOWED_THUMB_MAGIC   = {b"\xff\xd8\xff", b"\x89PNG", b"RIFF", b"WEBP"}  # JPEG/PNG/WEBP
+MAX_THUMB_BYTES       = 10 * 1024 * 1024  # 10MB
+
+# ジョブTTL: 完了から1時間でディレクトリ削除
+JOB_TTL_SECONDS = 3600
+
+# ffmpegタイムアウト
+FFMPEG_TIMEOUT = 300  # 5分
 SHORT_W    = 720
 SHORT_H    = 1280
 HEADER_H   = 260
