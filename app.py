@@ -404,7 +404,7 @@ def status(job_id: str, _: None = Depends(require_auth)):
     return job
 
 @app.get("/download/{job_id}/{filename}")
-def download(job_id: str, filename: str):
+def download(job_id: str, filename: str, _: None = Depends(require_auth)):
     # パストラバーサル防止: job_id・filename にスラッシュ・ドットドットを含む場合は拒否
     if "/" in job_id or ".." in job_id or "/" in filename or ".." in filename:
         return JSONResponse({"error": "invalid path"}, status_code=400)
