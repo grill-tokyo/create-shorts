@@ -389,7 +389,7 @@ async def generate(
     with open(thumb_path, "wb") as f:
         f.write(thumb_data)
 
-    jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+    _create_job(job_id)
     background_tasks.add_task(
         run_job, job_id, youtube_url, thumb_path, channel, title, num_clips,
         clip_duration, instruction
