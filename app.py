@@ -208,12 +208,12 @@ def run_job(job_id: str, youtube_url: str, thumb_path: str,
             else:
                 log(job_id, f"   ❌ 合成失敗")
 
-        jobs[job_id]["results"] = results
+        _set_results(job_id, results)
         set_progress(job_id, 100, "done")
         log(job_id, f"🎉 完了！{len(results)}件のショート動画を生成しました")
 
     except Exception as e:
-        jobs[job_id]["error"] = str(e)
+        _set_error(job_id, str(e))
         set_progress(job_id, -1, "error")
         log(job_id, f"❌ エラー: {e}")
 
