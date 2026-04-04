@@ -49,7 +49,7 @@ class TestPathTraversal:
         # FastAPIのルーティング上404になる場合もOK（パス区切りがルートに届かない）
         assert res.status_code in (400, 404)
 
-    def test_valid_job_and_filename_accepted(self, tmp_path):
+    def test_valid_job_and_filename_accepted(self):
         """正常なjob_id+filenameはファイルが存在すれば200"""
         job_id = "test-job-valid"
         job_dir = app_module.WORK_DIR / job_id
