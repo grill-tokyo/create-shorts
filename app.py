@@ -286,10 +286,18 @@ async def generate(
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = Path(thumbnail.filename).suffix or ".jpg"
+    # S3: サムネイル検証（拡張子・サイズ・マジックバイト）
+    ext = Path(thumbnail.filename or "").suffix.lower() or ".jpg"
+    if ext not in ALLOWED_THUMB_EXTS:
+        raise HTTPException(status_code=400, detail=f"画像形式が不正です（許可: jpg/png/webp）")
+    thumb_data = await thumbnail.read()
+    if len(thumb_data) > MAX_THUMB_BYTES:
+        raise HTTPException(status_code=400, detail="画像サイズが上限（10MB）を超えています")
+    if not any(thumb_data[:4].startswith(m) or thumb_data[8:12] == m for m in ALLOWED_THUMB_MAGIC):
+        raise HTTPException(status_code=400, detail="画像ファイルが不正です")
     thumb_path = str(job_dir / f"thumb{ext}")
     with open(thumb_path, "wb") as f:
-        f.write(await thumbnail.read())
+        f.write(thumb_data)
 
     jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
     background_tasks.add_task(
