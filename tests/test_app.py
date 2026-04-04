@@ -68,9 +68,8 @@ class TestPathTraversal:
         res = client.get("/download/nonexistent-job/nonexistent.mp4")
         assert res.status_code == 404
 
-    def test_resolved_path_must_be_under_work_dir(self, tmp_path):
+    def test_resolved_path_must_be_under_work_dir(self):
         """resolve()後のパスがWORK_DIR配下でなければ400"""
-        # シンボリックリンクでWORK_DIR外を指すケースを模倣
         job_id = "symlink-test"
         job_dir = app_module.WORK_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +77,6 @@ class TestPathTraversal:
         try:
             link.symlink_to("/etc/passwd")
             res = client.get(f"/download/{job_id}/evil.mp4")
-            # resolveしたパスが/etc/passwdになるので400 or 404
             assert res.status_code in (400, 404)
         except (OSError, NotImplementedError):
             pytest.skip("symlink not supported")
