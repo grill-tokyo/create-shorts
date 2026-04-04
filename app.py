@@ -264,7 +264,7 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
         "-c:a", "aac", "-shortest", "-movflags", "+faststart",
         out_path
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
     return r.returncode == 0
 
 
