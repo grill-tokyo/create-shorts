@@ -294,6 +294,105 @@ class TestJobCleanup:
 # ── B3: ffmpegタイムアウト ────────────────────────────────────
 
 class TestFfmpegTimeout:
+# ── S4: Basic認証 ────────────────────────────────────────────
+
+class TestAuthentication:
+    def test_no_auth_returns_401(self):
+        """認証なしアクセスは401"""
+        res = client_noauth.get("/")
+        assert res.status_code == 401
+
+    def test_wrong_password_returns_401(self):
+        """パスワード誤りは401"""
+        bad = TestClient(app_module.app, auth=("testuser", "wrongpass"))
+        res = bad.get("/")
+        assert res.status_code == 401
+
+    def test_correct_auth_returns_200(self):
+        """正しい認証は200"""
+        res = client.get("/")
+        assert res.status_code == 200
+
+    def test_api_generate_no_auth_returns_401(self):
+        """/api/generate も認証必須"""
+        dummy = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client_noauth.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": ("t.jpg", dummy, "image/jpeg")},
+        )
+        assert res.status_code == 401
+
+    def test_api_status_no_auth_returns_401(self):
+        """/api/status も認証必須"""
+        res = client_noauth.get("/api/status/some-job")
+        assert res.status_code == 401
+
+    def test_download_no_auth_returns_401(self):
+        """/download も認証必須"""
+        res = client_noauth.get("/download/some-job/file.mp4")
+        assert res.status_code == 401
+
+
+# ── B1: SQLiteジョブ管理 ─────────────────────────────────────
+
+class TestSQLiteJobManagement:
+    def test_create_and_get_job(self):
+        """ジョブ作成後にgetできる"""
+        job_id = "sqlite-test-1"
+        app_module._create_job(job_id)
+        job = app_module._get_job(job_id)
+        assert job is not None
+        assert job["status"] == "running"
+        assert job["progress"] == 0
+        assert job["logs"] == []
+
+    def test_log_appends_to_db(self):
+        """log()がSQLiteに追記される"""
+        job_id = "sqlite-test-2"
+        app_module._create_job(job_id)
+        app_module.log(job_id, "step1")
+        app_module.log(job_id, "step2")
+        job = app_module._get_job(job_id)
+        assert "step1" in job["logs"]
+        assert "step2" in job["logs"]
+
+    def test_set_progress_updates_db(self):
+        """set_progress()がSQLiteを更新する"""
+        job_id = "sqlite-test-3"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 50, "running")
+        job = app_module._get_job(job_id)
+        assert job["progress"] == 50
+        assert job["status"] == "running"
+
+    def test_done_sets_finished_at(self):
+        """status=doneでfinished_atが記録される"""
+        job_id = "sqlite-test-4"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 100, "done")
+        job = app_module._get_job(job_id)
+        assert job["finished_at"] is not None
+
+    def test_set_results_persisted(self):
+        """_set_results()の結果がSQLiteから取得できる"""
+        job_id = "sqlite-test-5"
+        app_module._create_job(job_id)
+        results = [{"rank": 1, "filename": "short_01.mp4", "size_mb": 5.2}]
+        app_module._set_results(job_id, results)
+        job = app_module._get_job(job_id)
+        assert job["results"][0]["filename"] == "short_01.mp4"
+
+    def test_nonexistent_job_returns_none(self):
+        """存在しないjob_idはNoneを返す"""
+        assert app_module._get_job("does-not-exist-xyz") is None
+
+
+# ── B3: ffmpegタイムアウト ────────────────────────────────────
+
+class TestFfmpegTimeout:
     def test_timeout_passed_to_subprocess(self):
         """subprocess.runにtimeoutが渡されている"""
         captured = {}
