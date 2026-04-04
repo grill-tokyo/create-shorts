@@ -25,9 +25,12 @@ app_module.WORK_DIR = Path(_tmp_dir)
 app_module.DB_PATH  = Path(_tmp_dir) / "jobs_test.db"
 app_module._init_db()
 
-# 認証付きクライアント
-client      = TestClient(app_module.app, auth=("testuser", "testpass"))
-client_noauth = TestClient(app_module.app)  # 認証なし
+import base64
+_auth_header = "Basic " + base64.b64encode(b"testuser:testpass").decode()
+_bad_header  = "Basic " + base64.b64encode(b"testuser:wrongpass").decode()
+
+client        = TestClient(app_module.app, headers={"Authorization": _auth_header})
+client_noauth = TestClient(app_module.app)
 
 
 # ── S1: パストラバーサル防止 ──────────────────────────────────
