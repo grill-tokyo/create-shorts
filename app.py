@@ -397,10 +397,11 @@ async def generate(
     return {"job_id": job_id}
 
 @app.get("/api/status/{job_id}")
-def status(job_id: str):
-    if job_id not in jobs:
+def status(job_id: str, _: None = Depends(require_auth)):
+    job = _get_job(job_id)
+    if job is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return jobs[job_id]
+    return job
 
 @app.get("/download/{job_id}/{filename}")
 def download(job_id: str, filename: str):
