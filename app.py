@@ -369,7 +369,8 @@ async def generate(
     num_clips: int = Form(3),
     clip_duration: int = Form(35),
     instruction: str = Form(""),
-    thumbnail: UploadFile = File(...)
+    thumbnail: UploadFile = File(...),
+    _: None = Depends(require_auth),
 ):
     job_id = str(uuid.uuid4())
     job_dir = WORK_DIR / job_id
