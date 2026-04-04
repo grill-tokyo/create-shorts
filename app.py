@@ -268,8 +268,21 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
     return r.returncode == 0
 
 
+def _cleanup_worker():
+    """B2: 完了・失敗ジョブをTTL経過後に削除するバックグラウンドスレッド"""
+    while True:
+        time.sleep(300)  # 5分ごとにチェック
+        now = time.time()
+        for job_id, job in list(jobs.items()):
+            if job.get("status") in ("done", "error"):
+                finished_at = job.get("finished_at", now)
+                if now - finished_at >= JOB_TTL_SECONDS:
+                    shutil.rmtree(WORK_DIR / job_id, ignore_errors=True)
+                    jobs.pop(job_id, None)
+
 app = FastAPI()
 WORK_DIR.mkdir(exist_ok=True)
+threading.Thread(target=_cleanup_worker, daemon=True).start()
 
 @app.post("/api/generate")
 async def generate(
