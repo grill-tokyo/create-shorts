@@ -57,6 +57,8 @@ def log(job_id: str, msg: str):
 def set_progress(job_id: str, pct: int, status: str = "running"):
     jobs[job_id]["progress"] = pct
     jobs[job_id]["status"]   = status
+    if status in ("done", "error"):
+        jobs[job_id]["finished_at"] = time.time()
 
 # ── メイン処理（バックグラウンド） ──────────────────────────
 def run_job(job_id: str, youtube_url: str, thumb_path: str,
