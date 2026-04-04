@@ -18,9 +18,27 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WORK_DIR   = Path("./web_output")
 DB_PATH    = WORK_DIR / "jobs.db"
 
-# S4: Basic認証（環境変数必須）
-APP_USERNAME = os.environ.get("APP_USERNAME", "")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+# S4: Basic認証（環境変数 or 自動生成）
+AUTH_FILE    = WORK_DIR / ".auth"
+
+def _load_or_create_auth() -> tuple[str, str]:
+    """環境変数があればそれを使用。なければ初回起動時に自動生成してファイルに保存。"""
+    u = os.environ.get("APP_USERNAME", "")
+    p = os.environ.get("APP_PASSWORD", "")
+    if u and p:
+        return u, p
+    WORK_DIR.mkdir(exist_ok=True)
+    if AUTH_FILE.exists():
+        line = AUTH_FILE.read_text().strip()
+        u, p = line.split(":", 1)
+        return u, p
+    u = "grill"
+    p = secrets.token_urlsafe(16)
+    AUTH_FILE.write_text(f"{u}:{p}")
+    AUTH_FILE.chmod(0o600)
+    return u, p
+
+APP_USERNAME, APP_PASSWORD = _load_or_create_auth()
 
 # アップロード検証
 ALLOWED_THUMB_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
