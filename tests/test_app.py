@@ -1,8 +1,8 @@
 """
 create-shorts app.py セキュリティ修正のテスト
-対象: パストラバーサル(S1)・ffmpegインジェクション(S2)・アップロード検証(S3)・TTLクリーンアップ(B2)・ffmpegタイムアウト(B3)
+対象: パストラバーサル(S1)・ffmpegインジェクション(S2)・アップロード検証(S3)・TTLクリーンアップ(B2)・ffmpegタイムアウト(B3)・認証(S4)・SQLiteジョブ管理(B1)
 """
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import time
@@ -11,12 +11,23 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
+# テスト用環境変数
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy"
+os.environ["APP_USERNAME"]      = "testuser"
+os.environ["APP_PASSWORD"]      = "testpass"
 
-# ANTHROPIC_API_KEY がなくても起動できるようにモック
+# テスト用にDBをインメモリ（一時ファイル）に向ける
+_tmp_dir = tempfile.mkdtemp()
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
 
 import app as app_module
-client = TestClient(app_module.app)
+app_module.WORK_DIR = Path(_tmp_dir)
+app_module.DB_PATH  = Path(_tmp_dir) / "jobs_test.db"
+app_module._init_db()
+
+# 認証付きクライアント
+client      = TestClient(app_module.app, auth=("testuser", "testpass"))
+client_noauth = TestClient(app_module.app)  # 認証なし
 
 
 # ── S1: パストラバーサル防止 ──────────────────────────────────
