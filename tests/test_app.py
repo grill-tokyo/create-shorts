@@ -5,7 +5,7 @@ create-shorts app.py セキュリティ修正のテスト
 import sys, os, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import time
+import time, shutil
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
