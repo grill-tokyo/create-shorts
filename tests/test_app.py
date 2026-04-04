@@ -291,9 +291,6 @@ class TestJobCleanup:
         del app_module.jobs[job_id]
 
 
-# ── B3: ffmpegタイムアウト ────────────────────────────────────
-
-class TestFfmpegTimeout:
 # ── S4: Basic認証 ────────────────────────────────────────────
 
 class TestAuthentication:
