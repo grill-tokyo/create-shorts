@@ -208,22 +208,39 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
     )
 
     if font_path:
-        ef = font_path.replace(":", "\\:")
-        ec = channel_name.replace("'","\\'").replace(":","\\:")
-        et = title_text.replace("'","\\'").replace(":","\\:")
+        # ffmpegフィルタ注入防止: テキストをファイル経由で渡す（textfile=オプション）
+        import tempfile, atexit
+        ef = font_path.replace("\\", "\\\\").replace(":", "\\:")
+        txt_dir = Path(out_path).parent
+
+        ch_file  = txt_dir / "ch.txt"
+        tit1_file = txt_dir / "tit1.txt"
+        tit2_file = txt_dir / "tit2.txt"
+
+        ch_file.write_text(channel_name, encoding="utf-8")
+
+        raw_title = title_text
         fc = fc.replace("[out]", "[pt]")
-        if len(et) > 12:
-            mid = len(et) // 2
-            sp  = et.find(" ", mid) if " " in et[mid:] else mid
-            t1, t2 = et[:sp].strip(), et[sp:].strip()
-            td = (f"drawtext=fontfile='{ef}':text='{t1}':fontsize=46:fontcolor=white"
+        if len(raw_title) > 12:
+            mid = len(raw_title) // 2
+            sp  = raw_title.find(" ", mid) if " " in raw_title[mid:] else mid
+            t1, t2 = raw_title[:sp].strip(), raw_title[sp:].strip()
+            tit1_file.write_text(t1, encoding="utf-8")
+            tit2_file.write_text(t2, encoding="utf-8")
+            ef1 = str(tit1_file).replace("\\", "\\\\").replace(":", "\\:")
+            ef2 = str(tit2_file).replace("\\", "\\\\").replace(":", "\\:")
+            td = (f"drawtext=fontfile='{ef}':textfile='{ef1}':fontsize=46:fontcolor=white"
                   f":x=(w-text_w)/2:y={title_box_y+20},"
-                  f"drawtext=fontfile='{ef}':text='{t2}':fontsize=46:fontcolor=white"
+                  f"drawtext=fontfile='{ef}':textfile='{ef2}':fontsize=46:fontcolor=white"
                   f":x=(w-text_w)/2:y={title_box_y+78}")
         else:
-            td = (f"drawtext=fontfile='{ef}':text='{et}':fontsize=46:fontcolor=white"
+            tit1_file.write_text(raw_title, encoding="utf-8")
+            ef1 = str(tit1_file).replace("\\", "\\\\").replace(":", "\\:")
+            td = (f"drawtext=fontfile='{ef}':textfile='{ef1}':fontsize=46:fontcolor=white"
                   f":x=(w-text_w)/2:y={title_box_y+40}")
-        fc += (f";[pt]drawtext=fontfile='{ef}':text='{ec}':fontsize=30:fontcolor=white"
+
+        ech_path = str(ch_file).replace("\\", "\\\\").replace(":", "\\:")
+        fc += (f";[pt]drawtext=fontfile='{ef}':textfile='{ech_path}':fontsize=30:fontcolor=white"
                f":x=(w-text_w)/2:y=28,{td}[out]")
 
     cmd = [
