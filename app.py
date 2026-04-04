@@ -5,16 +5,22 @@
 ブラウザ: http://localhost:8000
 """
 
-import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading, time
+import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading, time, sqlite3, secrets
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Depends, Security
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 # ── 設定 ────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WORK_DIR   = Path("./web_output")
+DB_PATH    = WORK_DIR / "jobs.db"
+
+# S4: Basic認証（環境変数必須）
+APP_USERNAME = os.environ.get("APP_USERNAME", "")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 # アップロード検証
 ALLOWED_THUMB_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
