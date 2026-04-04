@@ -678,5 +678,10 @@ if __name__ == "__main__":
         print("❌ ANTHROPIC_API_KEY が設定されていません")
         print("   export ANTHROPIC_API_KEY='sk-ant-...'")
         sys.exit(1)
+    if not APP_USERNAME or not APP_PASSWORD:
+        print("❌ APP_USERNAME / APP_PASSWORD が設定されていません")
+        print("   export APP_USERNAME='admin'")
+        print("   export APP_PASSWORD='your-strong-password'")
+        sys.exit(1)
     print("🎬 起動中... http://localhost:8000 をブラウザで開いてください（停止: Ctrl+C）")
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
