@@ -396,6 +396,60 @@ class TestSQLiteJobManagement:
         assert app_module._get_job("does-not-exist-xyz") is None
 
 
+# ── 認証自動生成 ─────────────────────────────────────────────
+
+class TestAuthAutoGenerate:
+    def test_creates_auth_file_when_missing(self, tmp_path):
+        """環境変数もファイルもない → .authを自動生成"""
+        auth_file = tmp_path / ".auth"
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.object(app_module, "WORK_DIR", tmp_path), \
+             patch.dict(os.environ, {}, clear=False) as env:
+            env.pop("APP_USERNAME", None)
+            env.pop("APP_PASSWORD", None)
+            u, p = app_module._load_or_create_auth()
+        assert auth_file.exists()
+        assert u == "grill"
+        assert len(p) >= 16
+
+    def test_reuses_existing_auth_file(self, tmp_path):
+        """既存の.authファイルがあれば再利用"""
+        auth_file = tmp_path / ".auth"
+        auth_file.write_text("myuser:mypassword")
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.object(app_module, "WORK_DIR", tmp_path), \
+             patch.dict(os.environ, {}, clear=False) as env:
+            env.pop("APP_USERNAME", None)
+            env.pop("APP_PASSWORD", None)
+            u, p = app_module._load_or_create_auth()
+        assert u == "myuser"
+        assert p == "mypassword"
+
+    def test_env_vars_take_priority(self, tmp_path):
+        """環境変数が設定されていればファイルより優先"""
+        auth_file = tmp_path / ".auth"
+        auth_file.write_text("fileuser:filepass")
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.dict(os.environ, {"APP_USERNAME": "envuser", "APP_PASSWORD": "envpass"}):
+            u, p = app_module._load_or_create_auth()
+        assert u == "envuser"
+        assert p == "envpass"
+
+    def test_each_run_generates_different_password(self, tmp_path):
+        """初回生成のパスワードは毎回異なる"""
+        passwords = set()
+        for i in range(5):
+            auth_file = tmp_path / f".auth{i}"
+            with patch.object(app_module, "AUTH_FILE", auth_file), \
+                 patch.object(app_module, "WORK_DIR", tmp_path), \
+                 patch.dict(os.environ, {}, clear=False) as env:
+                env.pop("APP_USERNAME", None)
+                env.pop("APP_PASSWORD", None)
+                _, p = app_module._load_or_create_auth()
+            passwords.add(p)
+        assert len(passwords) == 5
+
+
 # ── B3: ffmpegタイムアウト ────────────────────────────────────
 
 class TestFfmpegTimeout:
