@@ -313,7 +313,7 @@ class TestAuthentication:
 
     def test_wrong_password_returns_401(self):
         """パスワード誤りは401"""
-        bad = TestClient(app_module.app, auth=("testuser", "wrongpass"))
+        bad = TestClient(app_module.app, headers={"Authorization": _bad_header})
         res = bad.get("/")
         assert res.status_code == 401
 
