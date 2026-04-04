@@ -418,7 +418,7 @@ def download(job_id: str, filename: str, _: None = Depends(require_auth)):
                         headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(_: None = Depends(require_auth)):
     return HTML
 
 HTML = """<!DOCTYPE html>
