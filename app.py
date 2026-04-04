@@ -343,17 +343,21 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
 def _cleanup_worker():
     """B2: 完了・失敗ジョブをTTL経過後に削除するバックグラウンドスレッド"""
     while True:
-        time.sleep(300)  # 5分ごとにチェック
+        time.sleep(300)
         now = time.time()
-        for job_id, job in list(jobs.items()):
-            if job.get("status") in ("done", "error"):
-                finished_at = job.get("finished_at", now)
-                if now - finished_at >= JOB_TTL_SECONDS:
-                    shutil.rmtree(WORK_DIR / job_id, ignore_errors=True)
-                    jobs.pop(job_id, None)
+        with _db_lock, _get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if now - row["finished_at"] >= JOB_TTL_SECONDS:
+                shutil.rmtree(WORK_DIR / row["job_id"], ignore_errors=True)
+                with _db_lock, _get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
 
 app = FastAPI()
 WORK_DIR.mkdir(exist_ok=True)
+_init_db()
 threading.Thread(target=_cleanup_worker, daemon=True).start()
 
 @app.post("/api/generate")
