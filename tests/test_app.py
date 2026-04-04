@@ -149,17 +149,16 @@ class TestFfmpegInjection:
 # ── STEP3: ジョブ状態管理 ────────────────────────────────────
 
 class TestJobManagement:
-    def test_generate_returns_job_id(self, tmp_path):
+    def test_generate_returns_job_id(self):
         """POST /api/generate はjob_idを返す"""
-        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100  # JPEGマジックバイト
-        with patch.object(app_module, "ANTHROPIC_API_KEY", "sk-ant-dummy"):
-            res = client.post(
-                "/api/generate",
-                data={"youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                      "channel": "テスト", "title": "テスト", "num_clips": "1",
-                      "clip_duration": "30", "instruction": ""},
-                files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
-            )
+        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                  "channel": "テスト", "title": "テスト", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
+        )
         assert res.status_code == 200
         assert "job_id" in res.json()
 
@@ -169,13 +168,12 @@ class TestJobManagement:
         assert res.status_code == 404
 
     def test_status_known_job_returns_data(self):
-        """jobs dictに登録済みのjob_idはステータスを返す"""
+        """SQLiteに登録済みのjob_idはステータスを返す"""
         job_id = "manual-test-job"
-        app_module.jobs[job_id] = {"status": "running", "progress": 50, "logs": [], "results": []}
+        app_module._create_job(job_id)
         res = client.get(f"/api/status/{job_id}")
         assert res.status_code == 200
         assert res.json()["status"] == "running"
-        del app_module.jobs[job_id]
 
 
 # ── S3: サムネイルアップロード検証 ───────────────────────────
