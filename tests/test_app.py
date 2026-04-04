@@ -1,6 +1,6 @@
 """
 create-shorts app.py セキュリティ修正のテスト
-対象: パストラバーサル(S1)・ffmpegインジェクション(S2)
+対象: パストラバーサル(S1)・ffmpegインジェクション(S2)・アップロード検証(S3)・TTLクリーンアップ(B2)・ffmpegタイムアウト(B3)
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
