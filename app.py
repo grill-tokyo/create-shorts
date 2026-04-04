@@ -278,11 +278,17 @@ def status(job_id: str):
 
 @app.get("/download/{job_id}/{filename}")
 def download(job_id: str, filename: str):
-    path = WORK_DIR / job_id / filename
+    # パストラバーサル防止: job_id・filename にスラッシュ・ドットドットを含む場合は拒否
+    if "/" in job_id or ".." in job_id or "/" in filename or ".." in filename:
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    path = (WORK_DIR / job_id / filename).resolve()
+    base = WORK_DIR.resolve()
+    if not str(path).startswith(str(base) + "/"):
+        return JSONResponse({"error": "invalid path"}, status_code=400)
     if not path.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(str(path), media_type="video/mp4",
-                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+                        headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
 @app.get("/", response_class=HTMLResponse)
 def index():
