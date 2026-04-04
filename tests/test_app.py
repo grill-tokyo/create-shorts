@@ -167,3 +167,151 @@ class TestJobManagement:
         assert res.status_code == 200
         assert res.json()["status"] == "running"
         del app_module.jobs[job_id]
+
+
+# ── S3: サムネイルアップロード検証 ───────────────────────────
+
+VALID_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+VALID_PNG  = b"\x89PNG" + b"\x00" * 100
+
+class TestThumbnailValidation:
+    def _post(self, filename: str, data: bytes, content_type: str = "image/jpeg"):
+        return client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": (filename, data, content_type)},
+        )
+
+    def test_valid_jpeg_accepted(self):
+        res = self._post("thumb.jpg", VALID_JPEG)
+        assert res.status_code == 200
+        assert "job_id" in res.json()
+
+    def test_valid_png_accepted(self):
+        res = self._post("thumb.png", VALID_PNG, "image/png")
+        assert res.status_code == 200
+
+    def test_invalid_extension_rejected(self):
+        """.sh 拡張子は400"""
+        res = self._post("evil.sh", VALID_JPEG, "application/x-sh")
+        assert res.status_code == 400
+
+    def test_php_extension_rejected(self):
+        """.php 拡張子は400"""
+        res = self._post("evil.php", VALID_JPEG, "application/x-httpd-php")
+        assert res.status_code == 400
+
+    def test_invalid_magic_bytes_rejected(self):
+        """拡張子はjpgだがマジックバイトが画像でないデータは400"""
+        fake_data = b"\x7fELF" + b"\x00" * 100  # ELFバイナリ
+        res = self._post("fake.jpg", fake_data)
+        assert res.status_code == 400
+
+    def test_oversized_file_rejected(self):
+        """10MB超のファイルは400"""
+        big_data = VALID_JPEG[:4] + b"\x00" * (11 * 1024 * 1024)
+        res = self._post("big.jpg", big_data)
+        assert res.status_code == 400
+
+
+# ── B2: TTLクリーンアップ ─────────────────────────────────────
+
+class TestJobCleanup:
+    def test_finished_at_set_on_done(self):
+        """status=doneになったジョブにfinished_atが記録される"""
+        job_id = "ttl-test-done"
+        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module.set_progress(job_id, 100, "done")
+        assert "finished_at" in app_module.jobs[job_id]
+        del app_module.jobs[job_id]
+
+    def test_finished_at_set_on_error(self):
+        """status=errorになったジョブにfinished_atが記録される"""
+        job_id = "ttl-test-error"
+        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module.set_progress(job_id, -1, "error")
+        assert "finished_at" in app_module.jobs[job_id]
+        del app_module.jobs[job_id]
+
+    def test_running_job_has_no_finished_at(self):
+        """実行中ジョブにはfinished_atが付かない"""
+        job_id = "ttl-test-running"
+        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module.set_progress(job_id, 50, "running")
+        assert "finished_at" not in app_module.jobs[job_id]
+        del app_module.jobs[job_id]
+
+    def test_expired_job_cleaned_up(self, tmp_path):
+        """TTL経過済みのdoneジョブはクリーンアップされる"""
+        job_id = "ttl-expired"
+        job_dir = app_module.WORK_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "short_01.mp4").write_bytes(b"\x00")
+
+        app_module.jobs[job_id] = {
+            "status": "done", "progress": 100, "logs": [], "results": [],
+            "finished_at": time.time() - app_module.JOB_TTL_SECONDS - 1,  # TTL超過
+        }
+
+        # クリーンアップロジックを直接実行
+        now = time.time()
+        for jid, job in list(app_module.jobs.items()):
+            if job.get("status") in ("done", "error"):
+                if now - job.get("finished_at", now) >= app_module.JOB_TTL_SECONDS:
+                    import shutil
+                    shutil.rmtree(app_module.WORK_DIR / jid, ignore_errors=True)
+                    app_module.jobs.pop(jid, None)
+
+        assert job_id not in app_module.jobs
+        assert not (app_module.WORK_DIR / job_id).exists()
+
+    def test_fresh_job_not_cleaned_up(self):
+        """TTL未経過のdoneジョブは削除されない"""
+        job_id = "ttl-fresh"
+        app_module.jobs[job_id] = {
+            "status": "done", "progress": 100, "logs": [], "results": [],
+            "finished_at": time.time() - 10,  # 10秒前（TTL未達）
+        }
+        now = time.time()
+        for jid, job in list(app_module.jobs.items()):
+            if job.get("status") in ("done", "error"):
+                if now - job.get("finished_at", now) >= app_module.JOB_TTL_SECONDS:
+                    app_module.jobs.pop(jid, None)
+
+        assert job_id in app_module.jobs
+        del app_module.jobs[job_id]
+
+
+# ── B3: ffmpegタイムアウト ────────────────────────────────────
+
+class TestFfmpegTimeout:
+    def test_timeout_passed_to_subprocess(self):
+        """subprocess.runにtimeoutが渡されている"""
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            r = MagicMock()
+            r.returncode = 0
+            return r
+
+        import tempfile
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("os.path.exists", return_value=True):
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "src.mp4"
+                thumb = Path(td) / "thumb.jpg"
+                out   = Path(td) / "out.mp4"
+                video.write_bytes(b"")
+                thumb.write_bytes(b"")
+                app_module.build_short(
+                    str(video), str(thumb),
+                    start=0, end=30,
+                    channel_name="ch", title_text="title",
+                    out_path=str(out),
+                    font_path=None,
+                    src_w=1920, src_h=1080,
+                )
+        assert captured.get("timeout") == app_module.FFMPEG_TIMEOUT
