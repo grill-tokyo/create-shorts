@@ -232,26 +232,23 @@ class TestJobCleanup:
     def test_finished_at_set_on_done(self):
         """status=doneになったジョブにfinished_atが記録される"""
         job_id = "ttl-test-done"
-        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module._create_job(job_id)
         app_module.set_progress(job_id, 100, "done")
-        assert "finished_at" in app_module.jobs[job_id]
-        del app_module.jobs[job_id]
+        assert app_module._get_job(job_id)["finished_at"] is not None
 
     def test_finished_at_set_on_error(self):
         """status=errorになったジョブにfinished_atが記録される"""
         job_id = "ttl-test-error"
-        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module._create_job(job_id)
         app_module.set_progress(job_id, -1, "error")
-        assert "finished_at" in app_module.jobs[job_id]
-        del app_module.jobs[job_id]
+        assert app_module._get_job(job_id)["finished_at"] is not None
 
     def test_running_job_has_no_finished_at(self):
         """実行中ジョブにはfinished_atが付かない"""
         job_id = "ttl-test-running"
-        app_module.jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+        app_module._create_job(job_id)
         app_module.set_progress(job_id, 50, "running")
-        assert "finished_at" not in app_module.jobs[job_id]
-        del app_module.jobs[job_id]
+        assert app_module._get_job(job_id)["finished_at"] is None
 
     def test_expired_job_cleaned_up(self):
         """TTL経過済みのdoneジョブはクリーンアップされる"""
