@@ -53,8 +53,8 @@ FFMPEG_TIMEOUT = 300  # 5分
 SHORT_W    = 720
 SHORT_H    = 1280
 HEADER_H   = 260
-VIDEO_H    = 530
-THUMB_H    = 490
+VIDEO_H    = 600
+THUMB_H    = 420
 BORDER     = 8
 
 FONTS = [
@@ -122,6 +122,84 @@ def _get_job(job_id: str) -> dict | None:
     d["results"] = json.loads(d["results"] or "[]")
     return d
 
+def get_japanese_fonts() -> list[dict]:
+    """日本語対応フォントの一覧を返す [{name, path}, ...]"""
+    seen, fonts = set(), []
+
+    # macOS 既知フォント（優先リスト）
+    known = [
+        ("/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc", "ヒラギノ角ゴシック W6"),
+        ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "ヒラギノ角ゴシック W3"),
+        ("/System/Library/Fonts/ヒラギノ丸ゴ ProN W4.ttc",  "ヒラギノ丸ゴ ProN W4"),
+        ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",      "ヒラギノ明朝 ProN"),
+        ("/System/Library/Fonts/Hiragino Sans GB.ttc",       "Hiragino Sans GB"),
+        ("/System/Library/Fonts/Supplemental/Osaka.ttf",     "Osaka"),
+    ]
+    for path, name in known:
+        if os.path.exists(path) and path not in seen:
+            fonts.append({"name": name, "path": path})
+            seen.add(path)
+
+    # macOS フォントディレクトリをスキャン（日本語名またはCJKキーワードを含むもの）
+    scan_dirs = [
+        "/System/Library/Fonts",
+        "/Library/Fonts",
+        str(Path.home() / "Library/Fonts"),
+    ]
+    jp_keywords = re.compile(
+        r'hiragino|osaka|noto.*cjk|noto.*jp|yugothic|yumincho|meiryo|'
+        r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]',
+        re.IGNORECASE
+    )
+    for d in scan_dirs:
+        dp = Path(d)
+        if not dp.exists():
+            continue
+        for f in sorted(dp.glob("**/*.tt[cf]")):
+            path = str(f)
+            if path in seen:
+                continue
+            if jp_keywords.search(f.name):
+                name = f.stem
+                fonts.append({"name": name, "path": path})
+                seen.add(path)
+
+    if not fonts:
+        fb = find_font()
+        if fb:
+            fonts.append({"name": Path(fb).stem, "path": fb})
+    return fonts
+
+# ── Whisper ─────────────────────────────────────────────────
+_whisper_model = None  # グローバルキャッシュ（プロセス内で1回だけロード）
+
+def transcribe_audio(video_path: str, job_id: str) -> str:
+    """動画から音声を抽出し Whisper で文字起こし。タイムスタンプ付きテキストを返す。"""
+    global _whisper_model
+    import whisper
+    audio_path = str(Path(video_path).parent / "audio_tmp.wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path,
+         "-ar", "16000", "-ac", "1", "-f", "wav", audio_path],
+        capture_output=True, check=True
+    )
+    if _whisper_model is None:
+        _whisper_model = whisper.load_model("medium")
+    model = _whisper_model
+    result = model.transcribe(audio_path, language="ja", verbose=False)
+    Path(audio_path).unlink(missing_ok=True)
+
+    def fmt_ts(sec: float) -> str:
+        m, s = divmod(int(sec), 60)
+        return f"{m:02d}:{s:02d}"
+
+    lines = [
+        f"[{fmt_ts(seg['start'])}-{fmt_ts(seg['end'])}] {seg['text'].strip()}"
+        for seg in result.get("segments", [])
+        if seg["text"].strip()
+    ]
+    return "\n".join(lines)
+
 def log(job_id: str, msg: str):
     print(f"[{job_id[:6]}] {msg}")
     with _db_lock, _get_conn() as conn:
@@ -151,7 +229,8 @@ def _set_error(job_id: str, error: str):
 # ── メイン処理（バックグラウンド） ──────────────────────────
 def run_job(job_id: str, youtube_url: str, thumb_path: str,
             channel: str, title: str, num_clips: int,
-            clip_duration: int, instruction: str):
+            clip_duration: int, instruction: str, font_path: str,
+            use_whisper: bool = True):
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,13 +266,28 @@ def run_job(job_id: str, youtube_url: str, thumb_path: str,
         )
         log(job_id, f"📐 動画情報: {src_w}x{src_h}, {duration:.0f}秒")
 
+        # ── Whisper 文字起こし（スキップ可）
+        transcript = ""
+        if use_whisper:
+            log(job_id, "🎤 音声を文字起こし中... (Whisper medium)")
+            set_progress(job_id, 28)
+            try:
+                transcript = transcribe_audio(str(video_path), job_id)
+                log(job_id, f"✅ 文字起こし完了: {len(transcript.splitlines())}セグメント")
+            except Exception as te:
+                log(job_id, f"⚠️ 文字起こしエラー（続行）: {te}")
+        else:
+            log(job_id, "⏭️ 文字起こしをスキップ")
+        set_progress(job_id, 45)
+
         log(job_id, "🤖 Claudeがシーンを分析中...")
-        set_progress(job_id, 35)
-        clips = analyze_with_claude(duration, title, num_clips, clip_duration, instruction, job_id)
+        set_progress(job_id, 48)
+        clips = analyze_with_claude(duration, title, num_clips, clip_duration, instruction, transcript, job_id)
         log(job_id, f"✅ {len(clips)}件のシーンを検出")
         set_progress(job_id, 50)
 
-        font_path = find_font()
+        if not font_path or not os.path.exists(font_path):
+            font_path = find_font()
         log(job_id, f"🔤 フォント: {Path(font_path).name if font_path else 'なし'}")
 
         results = []
@@ -237,7 +331,8 @@ def run_job(job_id: str, youtube_url: str, thumb_path: str,
 
 
 def analyze_with_claude(duration: float, title: str, num_clips: int,
-                        clip_duration: int, instruction: str, job_id: str) -> list[dict]:
+                        clip_duration: int, instruction: str,
+                        transcript: str, job_id: str) -> list[dict]:
     import anthropic
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY が設定されていません。")
@@ -248,16 +343,29 @@ def analyze_with_claude(duration: float, title: str, num_clips: int,
 
     instruction_line = f"\n切り抜き指示: {instruction}" if instruction.strip() else ""
 
+    if transcript:
+        transcript_section = f"""
+## 音声文字起こし（タイムスタンプ付き）
+{transcript}
+
+文字起こしを参考に、以下の観点でシーンを選んでください：
+- 話の冒頭が唐突にならない（文脈の始まりになっている箇所）
+- 起承転結として成立しており、内容が完結している
+- 視聴者が最後まで見たくなる「引き」のある入り方
+- 結論や重要な情報が含まれている
+"""
+    else:
+        transcript_section = ""
+
     prompt = f"""以下の動画から、ショート動画として魅力的なシーンを{num_clips}箇所選んでください。
 
 動画タイトル: {title}
 動画の長さ: {duration:.0f}秒
 切り抜き目標: 各シーン約{clip_duration}秒（{dur_min}〜{dur_max}秒の範囲）{instruction_line}
-
+{transcript_section}
 条件:
-- 視聴者が最後まで見たくなる、内容的に完結したシーンを選ぶ
-- 開始・終了が話の途中にならないよう考慮する
 - シーン同士が重複しないようにする
+- start_seconds と end_seconds は文字起こしのタイムスタンプと一致させること
 
 以下のJSON形式のみで回答してください（説明文や```は不要）:
 {{"clips":[{{"rank":1,"title":"タイトル（20文字以内）","start_seconds":30.0,"end_seconds":65.0,"reason":"理由（50文字以内）"}}]}}"""
@@ -287,60 +395,68 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
     video_y  = HEADER_H
     thumb_y  = HEADER_H + VIDEO_H
 
-    va_w = W - BORDER * 2
-    va_h = VIDEO_H - BORDER * 2
-    sc_h = int(va_w * src_h / src_w)
-    if sc_h < va_h:
-        sc_w, sc_h = int(va_h * src_w / src_h), va_h
-    else:
-        sc_w = va_w
-    cx, cy = (sc_w - va_w) // 2, (sc_h - va_h) // 2
+    # ── フィットスケール: 映像を内寸に収める（クロップなし、テロップ切れなし）
+    inner_w = W - BORDER * 2          # 704
+    inner_h = VIDEO_H - BORDER * 2    # 映像エリア内寸高さ
+
+    ratio = min(inner_w / src_w, inner_h / src_h)
+    scaled_w = int(src_w * ratio)
+    scaled_h = int(src_h * ratio)
+
+    pad_x = (inner_w - scaled_w) // 2
+    pad_y = (inner_h - scaled_h) // 2
+
+    vid_x  = BORDER + pad_x
+    vid_y  = video_y + BORDER + pad_y
+
+    gold_x = vid_x - BORDER
+    gold_y = video_y + pad_y
+    gold_w = scaled_w + BORDER * 2
+    gold_h = scaled_h + BORDER * 2
 
     fc = (
         f"color=c=black:s={W}x{H}:d={duration}[bg];"
         f"color=c={dark_red}:s={W-40}x{title_box_h}:d={duration}[tb];"
         f"[bg][tb]overlay=x=20:y={title_box_y}[bg1];"
-        f"color=c={gold}:s={W}x{VIDEO_H}:d={duration}[gf];"
-        f"[bg1][gf]overlay=x=0:y={video_y}[bg2];"
-        f"[0:v]scale={sc_w}:{sc_h},crop={va_w}:{va_h}:{cx}:{cy}[vid];"
-        f"[bg2][vid]overlay=x={BORDER}:y={video_y+BORDER}[bg3];"
+        f"color=c={gold}:s={gold_w}x{gold_h}:d={duration}[gf];"
+        f"[bg1][gf]overlay=x={gold_x}:y={gold_y}[bg2];"
+        f"[0:v]scale={scaled_w}:{scaled_h}[vid];"
+        f"[bg2][vid]overlay=x={vid_x}:y={vid_y}[bg3];"
         f"[1:v]scale={W}:{THUMB_H}[th];"
         f"[bg3][th]overlay=x=0:y={thumb_y}[out]"
     )
 
     if font_path:
         # ffmpegフィルタ注入防止: テキストをファイル経由で渡す（textfile=オプション）
-        import tempfile, atexit
         ef = font_path.replace("\\", "\\\\").replace(":", "\\:")
         txt_dir = Path(out_path).parent
 
-        ch_file  = txt_dir / "ch.txt"
-        tit1_file = txt_dir / "tit1.txt"
-        tit2_file = txt_dir / "tit2.txt"
-
+        ch_file   = txt_dir / "ch.txt"
         ch_file.write_text(channel_name, encoding="utf-8")
+        ech_path  = str(ch_file).replace("\\", "\\\\").replace(":", "\\:")
 
-        raw_title = title_text
         fc = fc.replace("[out]", "[pt]")
-        if len(raw_title) > 12:
-            mid = len(raw_title) // 2
-            sp  = raw_title.find(" ", mid) if " " in raw_title[mid:] else mid
-            t1, t2 = raw_title[:sp].strip(), raw_title[sp:].strip()
-            tit1_file.write_text(t1, encoding="utf-8")
-            tit2_file.write_text(t2, encoding="utf-8")
-            ef1 = str(tit1_file).replace("\\", "\\\\").replace(":", "\\:")
-            ef2 = str(tit2_file).replace("\\", "\\\\").replace(":", "\\:")
-            td = (f"drawtext=fontfile='{ef}':textfile='{ef1}':fontsize=46:fontcolor=white"
-                  f":x=(w-text_w)/2:y={title_box_y+20},"
-                  f"drawtext=fontfile='{ef}':textfile='{ef2}':fontsize=46:fontcolor=white"
-                  f":x=(w-text_w)/2:y={title_box_y+78}")
-        else:
-            tit1_file.write_text(raw_title, encoding="utf-8")
-            ef1 = str(tit1_file).replace("\\", "\\\\").replace(":", "\\:")
-            td = (f"drawtext=fontfile='{ef}':textfile='{ef1}':fontsize=46:fontcolor=white"
-                  f":x=(w-text_w)/2:y={title_box_y+40}")
 
-        ech_path = str(ch_file).replace("\\", "\\\\").replace(":", "\\:")
+        # ── タイトル: \n 分割して行ごとに drawtext（textfile= 経由）
+        raw_lines = [l for l in title_text.split('\n') if l.strip()]
+        if not raw_lines:
+            raw_lines = [title_text]
+        font_size = 46
+        line_h    = 54
+        total_h   = len(raw_lines) * line_h
+        start_y   = title_box_y + max(4, (title_box_h - total_h) // 2)
+        td_parts  = []
+        for i, line in enumerate(raw_lines):
+            tit_file = txt_dir / f"tit{i}.txt"
+            tit_file.write_text(line.strip(), encoding="utf-8")
+            etit = str(tit_file).replace("\\", "\\\\").replace(":", "\\:")
+            y    = start_y + i * line_h
+            td_parts.append(
+                f"drawtext=fontfile='{ef}':textfile='{etit}':fontsize={font_size}:fontcolor=white"
+                f":x=(w-text_w)/2:y={y}"
+            )
+        td = ",".join(td_parts)
+
         fc += (f";[pt]drawtext=fontfile='{ef}':textfile='{ech_path}':fontsize=30:fontcolor=white"
                f":x=(w-text_w)/2:y=28,{td}[out]")
 
@@ -378,6 +494,23 @@ WORK_DIR.mkdir(exist_ok=True)
 _init_db()
 threading.Thread(target=_cleanup_worker, daemon=True).start()
 
+@app.get("/api/fonts")
+def api_fonts():
+    return get_japanese_fonts()
+
+@app.get("/api/font-file")
+def api_font_file(path: str):
+    """フォントファイルをブラウザに配信（承認済みパスのみ）"""
+    approved = {f["path"] for f in get_japanese_fonts()}
+    if path not in approved:
+        return JSONResponse({"error": "not allowed"}, status_code=403)
+    fp = Path(path)
+    if not fp.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    mime = "font/ttf" if fp.suffix.lower() == ".ttf" else "font/collection"
+    return FileResponse(str(fp), media_type=mime,
+                        headers={"Cache-Control": "public, max-age=86400"})
+
 @app.post("/api/generate")
 async def generate(
     background_tasks: BackgroundTasks,
@@ -387,6 +520,8 @@ async def generate(
     num_clips: int = Form(3),
     clip_duration: int = Form(35),
     instruction: str = Form(""),
+    font_path: str = Form(""),
+    use_whisper: bool = Form(True),
     thumbnail: UploadFile = File(...),
     _: None = Depends(require_auth),
 ):
@@ -410,7 +545,7 @@ async def generate(
     _create_job(job_id)
     background_tasks.add_task(
         run_job, job_id, youtube_url, thumb_path, channel, title, num_clips,
-        clip_duration, instruction
+        clip_duration, instruction, font_path, use_whisper
     )
     return {"job_id": job_id}
 
@@ -465,6 +600,10 @@ input[type=range]{flex:1;accent-color:#fff;height:4px;cursor:pointer}
 .dur-row{display:flex;align-items:center;gap:10px;margin-top:10px}
 .dur-row label{margin:0;white-space:nowrap}
 .dur-row input[type=number]{width:90px;flex-shrink:0}
+select{width:100%;background:#111;border:1px solid #333;border-radius:8px;padding:10px 12px;font-size:14px;color:#fff;outline:none;cursor:pointer;transition:border .15s;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23888' d='M6 8L0 0h12z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
+select:focus{border-color:#555}
+.font-hint{font-size:11px;color:#555;margin-top:5px}
+.title-hint{font-size:11px;color:#555;margin-top:5px}
 .thumb-zone{border:1.5px dashed #333;border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:all .15s;position:relative}
 .thumb-zone:hover,.thumb-zone.drag{border-color:#666;background:#222}
 .thumb-zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
@@ -501,9 +640,10 @@ input[type=range]{flex:1;accent-color:#fff;height:4px;cursor:pointer}
     <label>YouTube URL</label>
     <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=..." />
     <label>チャンネル名</label>
-    <input type="text" id="channel" placeholder="例: クリニックマーケのプロ" />
+    <input type="text" id="channel" placeholder="例: クリニックマーケのプロ" oninput="drawPreview()" />
     <label>タイトルテキスト（上部に表示）</label>
-    <input type="text" id="title" placeholder="例: 看板広告ってホントに必要！！？" />
+    <textarea id="title" rows="2" placeholder="例: 看板広告ってホントに必要！！？&#10;Shift+Enter で改行" oninput="drawPreview()"></textarea>
+    <p class="title-hint">Shift+Enter で改行を入れると、その位置で行が分かれて表示されます</p>
     <div class="row" style="margin-top:14px">
       <div>
         <label style="margin-top:0">生成するクリップ数</label>
@@ -521,6 +661,27 @@ input[type=range]{flex:1;accent-color:#fff;height:4px;cursor:pointer}
     </div>
     <label>切り抜きの指示（任意）</label>
     <textarea id="instruction" placeholder="例: 一番盛り上がる部分／結論を話しているシーン／笑えるところ"></textarea>
+    <label style="margin-top:12px;display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="useWhisper" checked style="width:16px;height:16px;cursor:pointer">
+      <span>音声文字起こし（Whisper）でシーン選択を改善する</span>
+    </label>
+    <p style="color:#888;font-size:12px;margin:4px 0 0 24px">※ 有効にすると動画の長さによって数分かかる場合があります</p>
+  </div>
+
+  <div class="card">
+    <h2>フォント設定</h2>
+    <label>使用フォント</label>
+    <select id="fontSelect" onchange="onFontChange()">
+      <option value="">読み込み中...</option>
+    </select>
+    <p class="font-hint" id="fontHint"></p>
+  </div>
+
+  <div class="card">
+    <h2>プレビュー（ヘッダー部分）</h2>
+    <canvas id="previewCanvas" width="720" height="260"
+      style="width:100%;border-radius:8px;display:block;background:#000"></canvas>
+    <p class="font-hint" style="margin-top:6px">チャンネル名・タイトル・フォントを変えるとリアルタイムで更新されます</p>
   </div>
 
   <div class="card">
@@ -557,6 +718,113 @@ input[type=range]{flex:1;accent-color:#fff;height:4px;cursor:pointer}
 
 <script>
 let pollTimer = null;
+
+// ── Canvas プレビュー定数（実寸 720x260）
+const PV_W = 720, PV_H = 260;
+const TITLE_BOX_Y = 80, TITLE_BOX_H = 150;
+const DARK_RED = '#7B1F2E';
+const PREVIEW_FONT = 'PreviewFont';
+let _loadedFontPath = '';
+
+async function loadPreviewFont(path) {
+  if (!path) { drawPreview(); return; }
+  if (path === _loadedFontPath) { drawPreview(); return; }
+  try {
+    // 既存の同名フォントを削除
+    const old = [...document.fonts].filter(f => f.family === PREVIEW_FONT);
+    old.forEach(f => document.fonts.delete(f));
+    const face = new FontFace(PREVIEW_FONT,
+      `url("/api/font-file?path=${encodeURIComponent(path)}")`);
+    await face.load();
+    document.fonts.add(face);
+    _loadedFontPath = path;
+  } catch(e) {
+    console.warn('フォント読み込み失敗:', e);
+  }
+  drawPreview();
+}
+
+function drawPreview() {
+  const canvas = document.getElementById('previewCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = PV_W, H = PV_H;
+
+  // 黒背景
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const fontFamily = _loadedFontPath
+    ? `"${PREVIEW_FONT}", sans-serif`
+    : '-apple-system, "Hiragino Sans", sans-serif';
+
+  // チャンネル名
+  const channel = document.getElementById('channel').value.trim() || 'チャンネル名';
+  ctx.font = `600 30px ${fontFamily}`;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText(channel, W / 2, 22);
+
+  // ダーク赤タイトルボックス
+  ctx.fillStyle = DARK_RED;
+  ctx.fillRect(20, TITLE_BOX_Y, W - 40, TITLE_BOX_H);
+
+  // タイトルテキスト（改行対応）
+  const raw = document.getElementById('title').value || 'タイトル';
+  const lines = raw.split('\\n').filter(l => l.trim());
+  const displayLines = lines.length ? lines : [raw];
+  const fontSize = 46, lineH = 54;
+  const totalH = displayLines.length * lineH;
+  const startY = TITLE_BOX_Y + Math.max(4, (TITLE_BOX_H - totalH) / 2);
+  ctx.font = `600 ${fontSize}px ${fontFamily}`;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  displayLines.forEach((line, i) => {
+    ctx.fillText(line.trim(), W / 2, startY + i * lineH);
+  });
+}
+
+// ── フォント一覧をサーバーから取得してセレクトに反映
+async function loadFonts() {
+  try {
+    const res   = await fetch('/api/fonts');
+    const fonts = await res.json();
+    const sel   = document.getElementById('fontSelect');
+    sel.innerHTML = fonts.map((f, i) =>
+      `<option value="${f.path}"${i===0?' selected':''}>${f.name}</option>`
+    ).join('');
+    updateFontHint();
+    // 初期フォントをロードしてプレビュー描画
+    if (fonts.length) await loadPreviewFont(fonts[0].path);
+  } catch(e) {
+    document.getElementById('fontSelect').innerHTML =
+      '<option value="">フォント取得失敗</option>';
+    drawPreview();
+  }
+}
+function updateFontHint() {
+  const sel  = document.getElementById('fontSelect');
+  const hint = document.getElementById('fontHint');
+  const opt  = sel.options[sel.selectedIndex];
+  hint.textContent = opt ? opt.value : '';
+}
+async function onFontChange() {
+  updateFontHint();
+  await loadPreviewFont(document.getElementById('fontSelect').value);
+}
+window.addEventListener('DOMContentLoaded', loadFonts);
+
+// ── タイトル textarea: Enter=改行なし、Shift+Enter=改行
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('title').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+    }
+  });
+});
+
 function previewThumb(input) {
   const file = input.files[0];
   if (!file) return;
@@ -584,10 +852,11 @@ function syncDur(src) {
 async function startJob() {
   const url         = document.getElementById('url').value.trim();
   const channel     = document.getElementById('channel').value.trim() || 'チャンネル名';
-  const title       = document.getElementById('title').value.trim() || 'タイトル';
+  const title       = document.getElementById('title').value || 'タイトル';
   const clips       = parseInt(document.getElementById('clips').value) || 3;
   const clipDur     = parseInt(document.getElementById('durInput').value) || 35;
   const instruction = document.getElementById('instruction').value.trim();
+  const fontPath    = document.getElementById('fontSelect').value;
   const file        = document.getElementById('thumbFile').files[0];
   const err = document.getElementById('errorBox');
   err.style.display = 'none';
@@ -604,6 +873,8 @@ async function startJob() {
   fd.append('num_clips', clips);
   fd.append('clip_duration', clipDur);
   fd.append('instruction', instruction);
+  fd.append('font_path', fontPath);
+  fd.append('use_whisper', document.getElementById('useWhisper').checked ? 'true' : 'false');
   fd.append('thumbnail', file);
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });
