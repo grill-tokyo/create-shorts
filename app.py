@@ -171,29 +171,21 @@ def get_japanese_fonts() -> list[dict]:
     return fonts
 
 # ── Whisper ─────────────────────────────────────────────────
-def ensure_whisper() -> bool:
-    try:
-        import whisper  # noqa: F401
-        return True
-    except ImportError:
-        print("openai-whisper が未インストール。自動インストール中...")
-        r = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "openai-whisper"],
-            capture_output=True, text=True
-        )
-        return r.returncode == 0
+_whisper_model = None  # グローバルキャッシュ（プロセス内で1回だけロード）
 
 def transcribe_audio(video_path: str, job_id: str) -> str:
     """動画から音声を抽出し Whisper で文字起こし。タイムスタンプ付きテキストを返す。"""
+    global _whisper_model
     import whisper
     audio_path = str(Path(video_path).parent / "audio_tmp.wav")
-    # 音声抽出
     subprocess.run(
         ["ffmpeg", "-y", "-i", video_path,
          "-ar", "16000", "-ac", "1", "-f", "wav", audio_path],
         capture_output=True, check=True
     )
-    model = whisper.load_model("medium")
+    if _whisper_model is None:
+        _whisper_model = whisper.load_model("medium")
+    model = _whisper_model
     result = model.transcribe(audio_path, language="ja", verbose=False)
     Path(audio_path).unlink(missing_ok=True)
 
@@ -237,7 +229,8 @@ def _set_error(job_id: str, error: str):
 # ── メイン処理（バックグラウンド） ──────────────────────────
 def run_job(job_id: str, youtube_url: str, thumb_path: str,
             channel: str, title: str, num_clips: int,
-            clip_duration: int, instruction: str, font_path: str):
+            clip_duration: int, instruction: str, font_path: str,
+            use_whisper: bool = True):
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -273,18 +266,18 @@ def run_job(job_id: str, youtube_url: str, thumb_path: str,
         )
         log(job_id, f"📐 動画情報: {src_w}x{src_h}, {duration:.0f}秒")
 
-        # ── Whisper 文字起こし
+        # ── Whisper 文字起こし（スキップ可）
         transcript = ""
-        log(job_id, "🎤 音声を文字起こし中... (Whisper medium)")
-        set_progress(job_id, 28)
-        try:
-            if ensure_whisper():
+        if use_whisper:
+            log(job_id, "🎤 音声を文字起こし中... (Whisper medium)")
+            set_progress(job_id, 28)
+            try:
                 transcript = transcribe_audio(str(video_path), job_id)
                 log(job_id, f"✅ 文字起こし完了: {len(transcript.splitlines())}セグメント")
-            else:
-                log(job_id, "⚠️ Whisperインストール失敗。文字起こしなしで続行します")
-        except Exception as te:
-            log(job_id, f"⚠️ 文字起こしエラー（続行）: {te}")
+            except Exception as te:
+                log(job_id, f"⚠️ 文字起こしエラー（続行）: {te}")
+        else:
+            log(job_id, "⏭️ 文字起こしをスキップ")
         set_progress(job_id, 45)
 
         log(job_id, "🤖 Claudeがシーンを分析中...")
@@ -528,6 +521,7 @@ async def generate(
     clip_duration: int = Form(35),
     instruction: str = Form(""),
     font_path: str = Form(""),
+    use_whisper: bool = Form(True),
     thumbnail: UploadFile = File(...),
     _: None = Depends(require_auth),
 ):
@@ -551,7 +545,7 @@ async def generate(
     _create_job(job_id)
     background_tasks.add_task(
         run_job, job_id, youtube_url, thumb_path, channel, title, num_clips,
-        clip_duration, instruction, font_path
+        clip_duration, instruction, font_path, use_whisper
     )
     return {"job_id": job_id}
 
@@ -667,6 +661,11 @@ select:focus{border-color:#555}
     </div>
     <label>切り抜きの指示（任意）</label>
     <textarea id="instruction" placeholder="例: 一番盛り上がる部分／結論を話しているシーン／笑えるところ"></textarea>
+    <label style="margin-top:12px;display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="useWhisper" checked style="width:16px;height:16px;cursor:pointer">
+      <span>音声文字起こし（Whisper）でシーン選択を改善する</span>
+    </label>
+    <p style="color:#888;font-size:12px;margin:4px 0 0 24px">※ 有効にすると動画の長さによって数分かかる場合があります</p>
   </div>
 
   <div class="card">
@@ -875,6 +874,7 @@ async function startJob() {
   fd.append('clip_duration', clipDur);
   fd.append('instruction', instruction);
   fd.append('font_path', fontPath);
+  fd.append('use_whisper', document.getElementById('useWhisper').checked ? 'true' : 'false');
   fd.append('thumbnail', file);
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });

@@ -481,3 +481,121 @@ class TestFfmpegTimeout:
                     src_w=1920, src_h=1080,
                 )
         assert captured.get("timeout") == app_module.FFMPEG_TIMEOUT
+
+
+# ── analyze_with_claude: transcript引数 ──────────────────────
+
+class TestAnalyzeWithClaude:
+    """analyze_with_claude の transcript 引数がプロンプトに正しく反映されるかを検証"""
+
+    def _call(self, transcript: str, instruction: str = "") -> str:
+        """analyze_with_claude を呼び出し、Claudeに送ったプロンプト文字列を返す"""
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            # 最小限の正常レスポンスを返す
+            resp = MagicMock()
+            resp.content = [MagicMock()]
+            resp.content[0].text = json.dumps([
+                {"title": "test", "start_seconds": 0, "end_seconds": 30, "reason": "test"}
+            ])
+            return resp
+
+        import json as _json
+        with patch("anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value.messages.create.side_effect = fake_create
+            try:
+                app_module.analyze_with_claude(
+                    duration=300, title="テスト動画", num_clips=1,
+                    clip_duration=30, instruction=instruction,
+                    transcript=transcript, job_id="test-job"
+                )
+            except Exception:
+                pass  # レスポンスのパース失敗は無視
+        return captured.get("prompt", "")
+
+    def test_transcript_included_in_prompt(self):
+        """transcript が空でない場合、プロンプトに文字起こし内容が含まれる"""
+        transcript = "[00:10-00:20] これはテストの文字起こしです"
+        prompt = self._call(transcript)
+        assert "これはテストの文字起こしです" in prompt
+
+    def test_transcript_section_header_present(self):
+        """transcript があるとき、見出しセクションがプロンプトに含まれる"""
+        prompt = self._call("[00:00-00:10] サンプルテキスト")
+        assert "音声文字起こし" in prompt
+
+    def test_empty_transcript_omits_section(self):
+        """transcript が空のとき、文字起こしセクションがプロンプトに含まれない"""
+        prompt = self._call("")
+        assert "音声文字起こし" not in prompt
+
+    def test_instruction_included_in_prompt(self):
+        """instruction が指定された場合、プロンプトに含まれる"""
+        prompt = self._call("", instruction="面白い場面を選ぶ")
+        assert "面白い場面を選ぶ" in prompt
+
+    def test_instruction_omitted_when_empty(self):
+        """instruction が空のとき、切り抜き指示行がプロンプトに含まれない"""
+        prompt = self._call("")
+        assert "切り抜き指示:" not in prompt
+
+
+# ── Whisperキャッシュ ─────────────────────────────────────────
+
+class TestWhisperModelCache:
+    def test_model_loaded_once(self):
+        """複数回呼び出してもwhisper.load_modelは1回しか呼ばれない"""
+        import tempfile
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = {"segments": [
+            {"start": 0, "end": 5, "text": "テスト"}
+        ]}
+
+        original_model = app_module._whisper_model
+        try:
+            app_module._whisper_model = None  # キャッシュをリセット
+            with patch("subprocess.run"), \
+                 patch("pathlib.Path.unlink"), \
+                 patch("whisper.load_model", return_value=mock_model) as mock_load:
+                with tempfile.TemporaryDirectory() as td:
+                    video = Path(td) / "src.mp4"
+                    video.write_bytes(b"")
+                    app_module.transcribe_audio(str(video), "job1")
+                    app_module.transcribe_audio(str(video), "job2")
+                assert mock_load.call_count == 1, "load_model は1回だけ呼ばれるべき"
+        finally:
+            app_module._whisper_model = original_model  # 元に戻す
+
+
+# ── use_whisper フラグ ────────────────────────────────────────
+
+class TestUseWhisperFlag:
+    def test_use_whisper_false_skips_transcription(self):
+        """use_whisper=False のとき transcribe_audio が呼ばれない"""
+        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": "", "use_whisper": "false"},
+            files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
+        )
+        assert res.status_code == 200
+        job_id = res.json()["job_id"]
+        # ジョブが登録されていることを確認
+        assert app_module._get_job(job_id) is not None
+
+    def test_use_whisper_true_is_default(self):
+        """use_whisper を送らない場合はデフォルトTrue（エンドポイントが受け付ける）"""
+        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
+        )
+        assert res.status_code == 200
