@@ -5,16 +5,51 @@
 ブラウザ: http://localhost:8000
 """
 
-import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading
+import os, sys, json, re, uuid, subprocess, urllib.request, shutil, threading, time, sqlite3, secrets
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Depends, Security
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 # ── 設定 ────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WORK_DIR   = Path("./web_output")
+DB_PATH    = WORK_DIR / "jobs.db"
+
+# S4: Basic認証（環境変数 or 自動生成）
+AUTH_FILE    = WORK_DIR / ".auth"
+
+def _load_or_create_auth() -> tuple[str, str]:
+    """環境変数があればそれを使用。なければ初回起動時に自動生成してファイルに保存。"""
+    u = os.environ.get("APP_USERNAME", "")
+    p = os.environ.get("APP_PASSWORD", "")
+    if u and p:
+        return u, p
+    WORK_DIR.mkdir(exist_ok=True)
+    if AUTH_FILE.exists():
+        line = AUTH_FILE.read_text().strip()
+        u, p = line.split(":", 1)
+        return u, p
+    u = "grill"
+    p = secrets.token_urlsafe(16)
+    AUTH_FILE.write_text(f"{u}:{p}")
+    AUTH_FILE.chmod(0o600)
+    return u, p
+
+APP_USERNAME, APP_PASSWORD = _load_or_create_auth()
+
+# アップロード検証
+ALLOWED_THUMB_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
+ALLOWED_THUMB_MAGIC   = {b"\xff\xd8\xff", b"\x89PNG", b"RIFF", b"WEBP"}  # JPEG/PNG/WEBP
+MAX_THUMB_BYTES       = 10 * 1024 * 1024  # 10MB
+
+# ジョブTTL: 完了から1時間でディレクトリ削除
+JOB_TTL_SECONDS = 3600
+
+# ffmpegタイムアウト
+FFMPEG_TIMEOUT = 300  # 5分
 SHORT_W    = 720
 SHORT_H    = 1280
 HEADER_H   = 260
@@ -36,16 +71,82 @@ def find_font():
         if line.strip() and os.path.exists(line.strip()): return line.strip()
     return None
 
-# ── ジョブ状態管理 ───────────────────────────────────────────
-jobs: dict[str, dict] = {}
+# ── S4: Basic認証 ────────────────────────────────────────────
+_security = HTTPBasic()
+
+def require_auth(credentials: HTTPBasicCredentials = Security(_security)):
+    if not APP_USERNAME or not APP_PASSWORD:
+        raise HTTPException(status_code=500, detail="APP_USERNAME / APP_PASSWORD が未設定です")
+    ok = (secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode()) and
+          secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode()))
+    if not ok:
+        raise HTTPException(status_code=401, detail="認証失敗",
+                            headers={"WWW-Authenticate": "Basic"})
+
+# ── B1: SQLiteジョブ管理 ─────────────────────────────────────
+_db_lock = threading.Lock()
+
+def _get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db():
+    with _db_lock, _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id      TEXT PRIMARY KEY,
+                status      TEXT    DEFAULT 'running',
+                progress    INTEGER DEFAULT 0,
+                logs        TEXT    DEFAULT '[]',
+                results     TEXT    DEFAULT '[]',
+                error       TEXT,
+                finished_at REAL
+            )
+        """)
+
+def _create_job(job_id: str):
+    with _db_lock, _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (job_id, status, progress, logs, results) VALUES (?,?,?,?,?)",
+            (job_id, "running", 0, "[]", "[]")
+        )
+
+def _get_job(job_id: str) -> dict | None:
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["logs"]    = json.loads(d["logs"]    or "[]")
+    d["results"] = json.loads(d["results"] or "[]")
+    return d
 
 def log(job_id: str, msg: str):
-    jobs[job_id]["logs"].append(msg)
     print(f"[{job_id[:6]}] {msg}")
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute("SELECT logs FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row:
+            logs = json.loads(row["logs"] or "[]")
+            logs.append(msg)
+            conn.execute("UPDATE jobs SET logs=? WHERE job_id=?", (json.dumps(logs, ensure_ascii=False), job_id))
 
 def set_progress(job_id: str, pct: int, status: str = "running"):
-    jobs[job_id]["progress"] = pct
-    jobs[job_id]["status"]   = status
+    finished_at = time.time() if status in ("done", "error") else None
+    with _db_lock, _get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET progress=?, status=?, finished_at=COALESCE(?,finished_at) WHERE job_id=?",
+            (pct, status, finished_at, job_id)
+        )
+
+def _set_results(job_id: str, results: list):
+    with _db_lock, _get_conn() as conn:
+        conn.execute("UPDATE jobs SET results=? WHERE job_id=?",
+                     (json.dumps(results, ensure_ascii=False), job_id))
+
+def _set_error(job_id: str, error: str):
+    with _db_lock, _get_conn() as conn:
+        conn.execute("UPDATE jobs SET error=? WHERE job_id=?", (error, job_id))
 
 # ── メイン処理（バックグラウンド） ──────────────────────────
 def run_job(job_id: str, youtube_url: str, thumb_path: str,
@@ -125,12 +226,12 @@ def run_job(job_id: str, youtube_url: str, thumb_path: str,
             else:
                 log(job_id, f"   ❌ 合成失敗")
 
-        jobs[job_id]["results"] = results
+        _set_results(job_id, results)
         set_progress(job_id, 100, "done")
         log(job_id, f"🎉 完了！{len(results)}件のショート動画を生成しました")
 
     except Exception as e:
-        jobs[job_id]["error"] = str(e)
+        _set_error(job_id, str(e))
         set_progress(job_id, -1, "error")
         log(job_id, f"❌ エラー: {e}")
 
@@ -253,12 +354,29 @@ def build_short(video_path, thumb_path, start, end, channel_name, title_text,
         "-c:a", "aac", "-shortest", "-movflags", "+faststart",
         out_path
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
     return r.returncode == 0
 
 
+def _cleanup_worker():
+    """B2: 完了・失敗ジョブをTTL経過後に削除するバックグラウンドスレッド"""
+    while True:
+        time.sleep(300)
+        now = time.time()
+        with _db_lock, _get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if now - row["finished_at"] >= JOB_TTL_SECONDS:
+                shutil.rmtree(WORK_DIR / row["job_id"], ignore_errors=True)
+                with _db_lock, _get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
+
 app = FastAPI()
 WORK_DIR.mkdir(exist_ok=True)
+_init_db()
+threading.Thread(target=_cleanup_worker, daemon=True).start()
 
 @app.post("/api/generate")
 async def generate(
@@ -269,18 +387,27 @@ async def generate(
     num_clips: int = Form(3),
     clip_duration: int = Form(35),
     instruction: str = Form(""),
-    thumbnail: UploadFile = File(...)
+    thumbnail: UploadFile = File(...),
+    _: None = Depends(require_auth),
 ):
     job_id = str(uuid.uuid4())
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = Path(thumbnail.filename).suffix or ".jpg"
+    # S3: サムネイル検証（拡張子・サイズ・マジックバイト）
+    ext = Path(thumbnail.filename or "").suffix.lower() or ".jpg"
+    if ext not in ALLOWED_THUMB_EXTS:
+        raise HTTPException(status_code=400, detail=f"画像形式が不正です（許可: jpg/png/webp）")
+    thumb_data = await thumbnail.read()
+    if len(thumb_data) > MAX_THUMB_BYTES:
+        raise HTTPException(status_code=400, detail="画像サイズが上限（10MB）を超えています")
+    if not any(thumb_data[:4].startswith(m) or thumb_data[8:12] == m for m in ALLOWED_THUMB_MAGIC):
+        raise HTTPException(status_code=400, detail="画像ファイルが不正です")
     thumb_path = str(job_dir / f"thumb{ext}")
     with open(thumb_path, "wb") as f:
-        f.write(await thumbnail.read())
+        f.write(thumb_data)
 
-    jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "results": []}
+    _create_job(job_id)
     background_tasks.add_task(
         run_job, job_id, youtube_url, thumb_path, channel, title, num_clips,
         clip_duration, instruction
@@ -288,13 +415,14 @@ async def generate(
     return {"job_id": job_id}
 
 @app.get("/api/status/{job_id}")
-def status(job_id: str):
-    if job_id not in jobs:
+def status(job_id: str, _: None = Depends(require_auth)):
+    job = _get_job(job_id)
+    if job is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return jobs[job_id]
+    return job
 
 @app.get("/download/{job_id}/{filename}")
-def download(job_id: str, filename: str):
+def download(job_id: str, filename: str, _: None = Depends(require_auth)):
     # パストラバーサル防止: job_id・filename にスラッシュ・ドットドットを含む場合は拒否
     if "/" in job_id or ".." in job_id or "/" in filename or ".." in filename:
         return JSONResponse({"error": "invalid path"}, status_code=400)
@@ -308,7 +436,7 @@ def download(job_id: str, filename: str):
                         headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(_: None = Depends(require_auth)):
     return HTML
 
 HTML = """<!DOCTYPE html>
@@ -568,5 +696,9 @@ if __name__ == "__main__":
         print("❌ ANTHROPIC_API_KEY が設定されていません")
         print("   export ANTHROPIC_API_KEY='sk-ant-...'")
         sys.exit(1)
+    if AUTH_FILE.exists() and not os.environ.get("APP_PASSWORD"):
+        print(f"🔑 認証情報（初回自動生成 → {AUTH_FILE}）")
+        print(f"   ユーザー名: {APP_USERNAME}")
+        print(f"   パスワード: {APP_PASSWORD}")
     print("🎬 起動中... http://localhost:8000 をブラウザで開いてください（停止: Ctrl+C）")
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

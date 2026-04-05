@@ -1,21 +1,36 @@
 """
 create-shorts app.py セキュリティ修正のテスト
-対象: パストラバーサル(S1)・ffmpegインジェクション(S2)
+対象: パストラバーサル(S1)・ffmpegインジェクション(S2)・アップロード検証(S3)・TTLクリーンアップ(B2)・ffmpegタイムアウト(B3)・認証(S4)・SQLiteジョブ管理(B1)
 """
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import time, shutil
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
+# テスト用環境変数
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy"
+os.environ["APP_USERNAME"]      = "testuser"
+os.environ["APP_PASSWORD"]      = "testpass"
 
-# ANTHROPIC_API_KEY がなくても起動できるようにモック
+# テスト用にDBをインメモリ（一時ファイル）に向ける
+_tmp_dir = tempfile.mkdtemp()
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
 
 import app as app_module
-client = TestClient(app_module.app)
+app_module.WORK_DIR = Path(_tmp_dir)
+app_module.DB_PATH  = Path(_tmp_dir) / "jobs_test.db"
+app_module._init_db()
+
+import base64
+_auth_header = "Basic " + base64.b64encode(b"testuser:testpass").decode()
+_bad_header  = "Basic " + base64.b64encode(b"testuser:wrongpass").decode()
+
+client        = TestClient(app_module.app, headers={"Authorization": _auth_header})
+client_noauth = TestClient(app_module.app)
 
 
 # ── S1: パストラバーサル防止 ──────────────────────────────────
@@ -37,7 +52,7 @@ class TestPathTraversal:
         # FastAPIのルーティング上404になる場合もOK（パス区切りがルートに届かない）
         assert res.status_code in (400, 404)
 
-    def test_valid_job_and_filename_accepted(self, tmp_path):
+    def test_valid_job_and_filename_accepted(self):
         """正常なjob_id+filenameはファイルが存在すれば200"""
         job_id = "test-job-valid"
         job_dir = app_module.WORK_DIR / job_id
@@ -56,9 +71,8 @@ class TestPathTraversal:
         res = client.get("/download/nonexistent-job/nonexistent.mp4")
         assert res.status_code == 404
 
-    def test_resolved_path_must_be_under_work_dir(self, tmp_path):
+    def test_resolved_path_must_be_under_work_dir(self):
         """resolve()後のパスがWORK_DIR配下でなければ400"""
-        # シンボリックリンクでWORK_DIR外を指すケースを模倣
         job_id = "symlink-test"
         job_dir = app_module.WORK_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +80,6 @@ class TestPathTraversal:
         try:
             link.symlink_to("/etc/passwd")
             res = client.get(f"/download/{job_id}/evil.mp4")
-            # resolveしたパスが/etc/passwdになるので400 or 404
             assert res.status_code in (400, 404)
         except (OSError, NotImplementedError):
             pytest.skip("symlink not supported")
@@ -139,17 +152,16 @@ class TestFfmpegInjection:
 # ── STEP3: ジョブ状態管理 ────────────────────────────────────
 
 class TestJobManagement:
-    def test_generate_returns_job_id(self, tmp_path):
+    def test_generate_returns_job_id(self):
         """POST /api/generate はjob_idを返す"""
-        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100  # JPEGマジックバイト
-        with patch.object(app_module, "ANTHROPIC_API_KEY", "sk-ant-dummy"):
-            res = client.post(
-                "/api/generate",
-                data={"youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                      "channel": "テスト", "title": "テスト", "num_clips": "1",
-                      "clip_duration": "30", "instruction": ""},
-                files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
-            )
+        dummy_image = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                  "channel": "テスト", "title": "テスト", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": ("thumb.jpg", dummy_image, "image/jpeg")},
+        )
         assert res.status_code == 200
         assert "job_id" in res.json()
 
@@ -159,10 +171,313 @@ class TestJobManagement:
         assert res.status_code == 404
 
     def test_status_known_job_returns_data(self):
-        """jobs dictに登録済みのjob_idはステータスを返す"""
+        """SQLiteに登録済みのjob_idはステータスを返す"""
         job_id = "manual-test-job"
-        app_module.jobs[job_id] = {"status": "running", "progress": 50, "logs": [], "results": []}
+        app_module._create_job(job_id)
         res = client.get(f"/api/status/{job_id}")
         assert res.status_code == 200
         assert res.json()["status"] == "running"
-        del app_module.jobs[job_id]
+
+
+# ── S3: サムネイルアップロード検証 ───────────────────────────
+
+VALID_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+VALID_PNG  = b"\x89PNG" + b"\x00" * 100
+
+class TestThumbnailValidation:
+    def _post(self, filename: str, data: bytes, content_type: str = "image/jpeg"):
+        return client.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": (filename, data, content_type)},
+        )
+
+    def test_valid_jpeg_accepted(self):
+        res = self._post("thumb.jpg", VALID_JPEG)
+        assert res.status_code == 200
+        assert "job_id" in res.json()
+
+    def test_valid_png_accepted(self):
+        res = self._post("thumb.png", VALID_PNG, "image/png")
+        assert res.status_code == 200
+
+    def test_invalid_extension_rejected(self):
+        """.sh 拡張子は400"""
+        res = self._post("evil.sh", VALID_JPEG, "application/x-sh")
+        assert res.status_code == 400
+
+    def test_php_extension_rejected(self):
+        """.php 拡張子は400"""
+        res = self._post("evil.php", VALID_JPEG, "application/x-httpd-php")
+        assert res.status_code == 400
+
+    def test_invalid_magic_bytes_rejected(self):
+        """拡張子はjpgだがマジックバイトが画像でないデータは400"""
+        fake_data = b"\x7fELF" + b"\x00" * 100  # ELFバイナリ
+        res = self._post("fake.jpg", fake_data)
+        assert res.status_code == 400
+
+    def test_oversized_file_rejected(self):
+        """10MB超のファイルは400"""
+        big_data = VALID_JPEG[:4] + b"\x00" * (11 * 1024 * 1024)
+        res = self._post("big.jpg", big_data)
+        assert res.status_code == 400
+
+
+# ── B2: TTLクリーンアップ ─────────────────────────────────────
+
+class TestJobCleanup:
+    def test_finished_at_set_on_done(self):
+        """status=doneになったジョブにfinished_atが記録される"""
+        job_id = "ttl-test-done"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 100, "done")
+        assert app_module._get_job(job_id)["finished_at"] is not None
+
+    def test_finished_at_set_on_error(self):
+        """status=errorになったジョブにfinished_atが記録される"""
+        job_id = "ttl-test-error"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, -1, "error")
+        assert app_module._get_job(job_id)["finished_at"] is not None
+
+    def test_running_job_has_no_finished_at(self):
+        """実行中ジョブにはfinished_atが付かない"""
+        job_id = "ttl-test-running"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 50, "running")
+        assert app_module._get_job(job_id)["finished_at"] is None
+
+    def test_expired_job_cleaned_up(self):
+        """TTL経過済みのdoneジョブはクリーンアップされる"""
+        job_id = "ttl-expired"
+        job_dir = app_module.WORK_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "short_01.mp4").write_bytes(b"\x00")
+
+        app_module._create_job(job_id)
+        expired_at = time.time() - app_module.JOB_TTL_SECONDS - 1
+        with app_module._db_lock, app_module._get_conn() as conn:
+            conn.execute("UPDATE jobs SET status='done', finished_at=? WHERE job_id=?",
+                         (expired_at, job_id))
+
+        # クリーンアップロジックを直接実行
+        now = time.time()
+        with app_module._db_lock, app_module._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if now - row["finished_at"] >= app_module.JOB_TTL_SECONDS:
+                shutil.rmtree(app_module.WORK_DIR / row["job_id"], ignore_errors=True)
+                with app_module._db_lock, app_module._get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
+
+        assert app_module._get_job(job_id) is None
+        assert not (app_module.WORK_DIR / job_id).exists()
+
+    def test_fresh_job_not_cleaned_up(self):
+        """TTL未経過のdoneジョブは削除されない"""
+        job_id = "ttl-fresh"
+        app_module._create_job(job_id)
+        fresh_at = time.time() - 10  # 10秒前（TTL未達）
+        with app_module._db_lock, app_module._get_conn() as conn:
+            conn.execute("UPDATE jobs SET status='done', finished_at=? WHERE job_id=?",
+                         (fresh_at, job_id))
+
+        now = time.time()
+        with app_module._db_lock, app_module._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, finished_at FROM jobs WHERE status IN ('done','error') AND finished_at IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if row["job_id"] == job_id and now - row["finished_at"] >= app_module.JOB_TTL_SECONDS:
+                with app_module._db_lock, app_module._get_conn() as conn:
+                    conn.execute("DELETE FROM jobs WHERE job_id=?", (row["job_id"],))
+
+        assert app_module._get_job(job_id) is not None
+
+
+# ── S4: Basic認証 ────────────────────────────────────────────
+
+class TestAuthentication:
+    def test_no_auth_returns_401(self):
+        """認証なしアクセスは401"""
+        res = client_noauth.get("/")
+        assert res.status_code == 401
+
+    def test_wrong_password_returns_401(self):
+        """パスワード誤りは401"""
+        bad = TestClient(app_module.app, headers={"Authorization": _bad_header})
+        res = bad.get("/")
+        assert res.status_code == 401
+
+    def test_correct_auth_returns_200(self):
+        """正しい認証は200"""
+        res = client.get("/")
+        assert res.status_code == 200
+
+    def test_api_generate_no_auth_returns_401(self):
+        """/api/generate も認証必須"""
+        dummy = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        res = client_noauth.post(
+            "/api/generate",
+            data={"youtube_url": "https://www.youtube.com/watch?v=test",
+                  "channel": "ch", "title": "t", "num_clips": "1",
+                  "clip_duration": "30", "instruction": ""},
+            files={"thumbnail": ("t.jpg", dummy, "image/jpeg")},
+        )
+        assert res.status_code == 401
+
+    def test_api_status_no_auth_returns_401(self):
+        """/api/status も認証必須"""
+        res = client_noauth.get("/api/status/some-job")
+        assert res.status_code == 401
+
+    def test_download_no_auth_returns_401(self):
+        """/download も認証必須"""
+        res = client_noauth.get("/download/some-job/file.mp4")
+        assert res.status_code == 401
+
+
+# ── B1: SQLiteジョブ管理 ─────────────────────────────────────
+
+class TestSQLiteJobManagement:
+    def test_create_and_get_job(self):
+        """ジョブ作成後にgetできる"""
+        job_id = "sqlite-test-1"
+        app_module._create_job(job_id)
+        job = app_module._get_job(job_id)
+        assert job is not None
+        assert job["status"] == "running"
+        assert job["progress"] == 0
+        assert job["logs"] == []
+
+    def test_log_appends_to_db(self):
+        """log()がSQLiteに追記される"""
+        job_id = "sqlite-test-2"
+        app_module._create_job(job_id)
+        app_module.log(job_id, "step1")
+        app_module.log(job_id, "step2")
+        job = app_module._get_job(job_id)
+        assert "step1" in job["logs"]
+        assert "step2" in job["logs"]
+
+    def test_set_progress_updates_db(self):
+        """set_progress()がSQLiteを更新する"""
+        job_id = "sqlite-test-3"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 50, "running")
+        job = app_module._get_job(job_id)
+        assert job["progress"] == 50
+        assert job["status"] == "running"
+
+    def test_done_sets_finished_at(self):
+        """status=doneでfinished_atが記録される"""
+        job_id = "sqlite-test-4"
+        app_module._create_job(job_id)
+        app_module.set_progress(job_id, 100, "done")
+        job = app_module._get_job(job_id)
+        assert job["finished_at"] is not None
+
+    def test_set_results_persisted(self):
+        """_set_results()の結果がSQLiteから取得できる"""
+        job_id = "sqlite-test-5"
+        app_module._create_job(job_id)
+        results = [{"rank": 1, "filename": "short_01.mp4", "size_mb": 5.2}]
+        app_module._set_results(job_id, results)
+        job = app_module._get_job(job_id)
+        assert job["results"][0]["filename"] == "short_01.mp4"
+
+    def test_nonexistent_job_returns_none(self):
+        """存在しないjob_idはNoneを返す"""
+        assert app_module._get_job("does-not-exist-xyz") is None
+
+
+# ── 認証自動生成 ─────────────────────────────────────────────
+
+class TestAuthAutoGenerate:
+    def test_creates_auth_file_when_missing(self, tmp_path):
+        """環境変数もファイルもない → .authを自動生成"""
+        auth_file = tmp_path / ".auth"
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.object(app_module, "WORK_DIR", tmp_path), \
+             patch.dict(os.environ, {}, clear=False) as env:
+            env.pop("APP_USERNAME", None)
+            env.pop("APP_PASSWORD", None)
+            u, p = app_module._load_or_create_auth()
+        assert auth_file.exists()
+        assert u == "grill"
+        assert len(p) >= 16
+
+    def test_reuses_existing_auth_file(self, tmp_path):
+        """既存の.authファイルがあれば再利用"""
+        auth_file = tmp_path / ".auth"
+        auth_file.write_text("myuser:mypassword")
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.object(app_module, "WORK_DIR", tmp_path), \
+             patch.dict(os.environ, {}, clear=False) as env:
+            env.pop("APP_USERNAME", None)
+            env.pop("APP_PASSWORD", None)
+            u, p = app_module._load_or_create_auth()
+        assert u == "myuser"
+        assert p == "mypassword"
+
+    def test_env_vars_take_priority(self, tmp_path):
+        """環境変数が設定されていればファイルより優先"""
+        auth_file = tmp_path / ".auth"
+        auth_file.write_text("fileuser:filepass")
+        with patch.object(app_module, "AUTH_FILE", auth_file), \
+             patch.dict(os.environ, {"APP_USERNAME": "envuser", "APP_PASSWORD": "envpass"}):
+            u, p = app_module._load_or_create_auth()
+        assert u == "envuser"
+        assert p == "envpass"
+
+    def test_each_run_generates_different_password(self, tmp_path):
+        """初回生成のパスワードは毎回異なる"""
+        passwords = set()
+        for i in range(5):
+            auth_file = tmp_path / f".auth{i}"
+            with patch.object(app_module, "AUTH_FILE", auth_file), \
+                 patch.object(app_module, "WORK_DIR", tmp_path), \
+                 patch.dict(os.environ, {}, clear=False) as env:
+                env.pop("APP_USERNAME", None)
+                env.pop("APP_PASSWORD", None)
+                _, p = app_module._load_or_create_auth()
+            passwords.add(p)
+        assert len(passwords) == 5
+
+
+# ── B3: ffmpegタイムアウト ────────────────────────────────────
+
+class TestFfmpegTimeout:
+    def test_timeout_passed_to_subprocess(self):
+        """subprocess.runにtimeoutが渡されている"""
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            r = MagicMock()
+            r.returncode = 0
+            return r
+
+        import tempfile
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("os.path.exists", return_value=True):
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "src.mp4"
+                thumb = Path(td) / "thumb.jpg"
+                out   = Path(td) / "out.mp4"
+                video.write_bytes(b"")
+                thumb.write_bytes(b"")
+                app_module.build_short(
+                    str(video), str(thumb),
+                    start=0, end=30,
+                    channel_name="ch", title_text="title",
+                    out_path=str(out),
+                    font_path=None,
+                    src_w=1920, src_h=1080,
+                )
+        assert captured.get("timeout") == app_module.FFMPEG_TIMEOUT
