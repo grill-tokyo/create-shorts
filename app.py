@@ -661,10 +661,10 @@ select:focus{border-color:#555}
     </div>
     <label>切り抜きの指示（任意）</label>
     <textarea id="instruction" placeholder="例: 一番盛り上がる部分／結論を話しているシーン／笑えるところ"></textarea>
-    <label style="margin-top:12px;display:flex;align-items:center;gap:8px;cursor:pointer">
-      <input type="checkbox" id="useWhisper" checked style="width:16px;height:16px;cursor:pointer">
-      <span>音声文字起こし（Whisper）でシーン選択を改善する</span>
-    </label>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:8px;cursor:pointer" onclick="document.getElementById('useWhisper').click()">
+      <input type="checkbox" id="useWhisper" checked style="width:16px;height:16px;cursor:pointer" onclick="event.stopPropagation()">
+      <span style="font-size:13px;color:#aaa">音声文字起こし（Whisper）でシーン選択を改善する</span>
+    </div>
     <p style="color:#888;font-size:12px;margin:4px 0 0 24px">※ 有効にすると動画の長さによって数分かかる場合があります</p>
   </div>
 
